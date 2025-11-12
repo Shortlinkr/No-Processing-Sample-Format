@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NPSF Decoder</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: auto; }
+        h1 { text-align: center; }
+        canvas { border: 1px solid #ccc; display: block; margin: 20px auto; }
+        .status { font-size: 14px; color: #555; text-align: center; margin-top: 10px; }
+        .file-input { display: block; margin: 20px 0; }
+        .download-btn { display: inline-block; margin-top: 20px; padding: 10px 20px; background: #007BFF; color: white; text-decoration: none; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>NPSF Decoder</h1>
+    <p>Select an NPSF file to decode and display the image:</p>
+
+    <input id="fileInput" type="file" class="file-input" accept=".npsf">
+    <div class="status" id="status"></div>
+
+    <canvas id="canvas" style="display:none;"></canvas>
+    <div id="original-file-section" style="display:none;">
+        <h2>Original File:</h2>
+        <a id="download-link" href="#" class="download-btn" download="original-file">Download Original File</a>
+    </div>
+
+    <script>
+        // CRC32 implementation
+        function crc32(buf) {
+            if (!crc32.table) {
+                const table = new Uint32Array(256);
+                for (let i = 0; i < 256; i++) {
+                    let c = i;
+                    for (let j = 0; j < 8; j++) {
+                        if (c & 1) c = 0xEDB88320 ^ (c >>> 1);
+                        else c = c >>> 1;
+                    }
+                    table[i] = c >>> 0;
+                }
+                crc32.table = table;
+            }
+            const table = crc32.table;
+            let c = 0xFFFFFFFF;
+            for (let i = 0; i < buf.length; i++) {
+                c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+            }
+            return (~c) >>> 0;
+        }
+
+        // Function to read the .npsf file
+        function parseNpsf(data) {
+            let offset = 0;
+            const MAGIC = new TextEncoder().encode('NPSF\x01');
+            const chunks = {};
+
+            // Check for magic bytes
+            for (let i = 0; i < MAGIC.length; i++) {
+                if (data[i] !== MAGIC[i]) throw new Error('Invalid NPSF file');
+            }
+            offset += MAGIC.length;
+
+            // Read chunks
+            while (offset < data.byteLength) {
+                const length = new DataView(data.buffer, offset, 4).getUint32(0);
+                offset += 4;
+                const type = new TextDecoder().decode(new DataView(data.buffer, offset, 4));
+                offset += 4;
+
+                const chunkData = new Uint8Array(data.buffer, offset, length);
+                offset += length;
+
+                const crc = new DataView(data.buffer, offset, 4).getUint32(0);
+                offset += 4;
+
+                const calculatedCrc = crc32(new Uint8Array(data.buffer, offset - length - 4, length + 4));
+                if (crc !== calculatedCrc) {
+                    throw new Error(`CRC mismatch for ${type} chunk`);
+                }
+
+                chunks[type] = chunkData;
+            }
+
+            return chunks;
+        }
+
+        // Handle the file input and decode the NPSF
+        document.getElementById('fileInput').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            document.getElementById('status').textContent = 'Decoding .npsf file...';
+
+            const data = await file.arrayBuffer();
+            const chunks = parseNpsf(data);
+
+            // Decode the image data (IDATU)
+            if (chunks['IDATU']) {
+                const pixels = new Uint8Array(chunks['IDATU']);
+                const w = new DataView(pixels.buffer).getUint32(0, true);
+                const h = new DataView(pixels.buffer, 4).getUint32(0, true);
+                const imageData = new ImageData(new Uint8ClampedArray(pixels.slice(8)), w, h);
+
+                const canvas = document.getElementById('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = w;
+                canvas.height = h;
+                ctx.putImageData(imageData, 0, 0);
+
+                document.getElementById('status').textContent = 'Image decoded successfully!';
+                canvas.style.display = 'block';  // Show the canvas
+
+                // If the original file is embedded, show download link
+                if (chunks['ORIG']) {
+                    const originalFileBlob = new Blob([chunks['ORIG']]);
+                    const downloadLink = document.getElementById('download-link');
+                    downloadLink.href = URL.createObjectURL(originalFileBlob);
+                    document.getElementById('original-file-section').style.display = 'block';
+                }
+            } else {
+                document.getElementById('status').textContent = 'No image data found in .npsf file';
+            }
+        });
+    </script>
+</body>
+</html>
