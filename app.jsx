@@ -1,0 +1,195 @@
+import React, { useRef, useState } from 'react';
+
+// Single-file React component for GitHub Pages
+// - Uses the browser to decode common image formats to an 8-bit RGBA raster via <canvas>
+// - Produces an uncompressed NPSF (.npsf) file containing raw pixel samples (row-major, RGBA)
+// - Optionally embeds the original file bytes in an ORIG chunk so the original file can be recovered
+// - NOTE: Browsers decode images to 8-bit per channel sRGB when using canvas. This tool preserves
+//   those decoded samples exactly, but cannot access camera-native RAW sample formats. For true
+//   high-bit-depth/raw preservation, use a native tool or server-side converter that supports libraw.
+
+export default function NpsfConverter() {
+  const fileRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [originalName, setOriginalName] = useState('');
+  const [status, setStatus] = useState('');
+  const [embedOriginal, setEmbedOriginal] = useState(true);
+
+  // Magic and helper utilities
+  const MAGIC = new Uint8Array([0x4E,0x50,0x53,0x46,0x01]); // 'NPSF\x01'
+
+  function u32BE(n) {
+    const b = new Uint8Array(4);
+    b[0] = (n >>> 24) & 0xFF;
+    b[1] = (n >>> 16) & 0xFF;
+    b[2] = (n >>> 8) & 0xFF;
+    b[3] = (n >>> 0) & 0xFF;
+    return b;
+  }
+
+  async function buildNpsf(imageBitmap, originalFileBytes) {
+    // imageBitmap width/height; draw into canvas and read ImageData (8-bit RGBA)
+    const w = imageBitmap.width;
+    const h = imageBitmap.height;
+    const canvas = canvasRef.current;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    // draw with drawImage; this uses browser decoding
+    ctx.clearRect(0,0,w,h);
+    ctx.drawImage(imageBitmap, 0, 0, w, h);
+    const im = ctx.getImageData(0,0,w,h);
+    const pixels = im.data; // Uint8ClampedArray, length w*h*4, RGBA order
+
+    // header JSON
+    const header = {
+      width: w,
+      height: h,
+      channels: 4,
+      channel_order: 'RGBA',
+      bit_depth: 8,
+      sample_endianness: 'little',
+      color_space: 'sRGB (browser-decoded)',
+      alpha_premultiplied: false,
+      compression: 'none',
+      embed_original: !!originalFileBytes
+    };
+    const headerUtf8 = new TextEncoder().encode(JSON.stringify(header));
+
+    // IDATU payload: raw pixels row-major, already in RGBA order from ImageData
+    // Ensure it's a plain Uint8Array
+    const payload = new Uint8Array(pixels.buffer.slice(0));
+
+    // Build chunk helper
+    function makeChunk(typeStr, dataUint8) {
+      const typeBytes = new TextEncoder().encode(typeStr);
+      const lenBytes = u32BE(dataUint8.length);
+      const chunk = new Uint8Array(4 + 4 + dataUint8.length + 4);
+      chunk.set(typeBytes, 0);
+      chunk.set(lenBytes, 4);
+      chunk.set(dataUint8, 8);
+      // compute CRC32 over (type + data)
+      const crcInput = new Uint8Array(typeBytes.length + dataUint8.length);
+      crcInput.set(typeBytes, 0);
+      crcInput.set(dataUint8, typeBytes.length);
+      const crc = crc32(crcInput);
+      const crcBytes = u32BE(crc);
+      chunk.set(crcBytes, 8 + dataUint8.length);
+      return chunk;
+    }
+
+    // Build the file parts
+    const parts = [];
+    parts.push(MAGIC);
+    parts.push(u32BE(headerUtf8.length));
+    parts.push(headerUtf8);
+
+    // IDATU chunk
+    parts.push(makeChunk('IDATU', payload));
+
+    // Optional ORIG chunk
+    if (originalFileBytes) {
+      parts.push(makeChunk('ORIG', originalFileBytes));
+    }
+
+    // END! chunk (empty data)
+    parts.push(makeChunk('END!', new Uint8Array(0)));
+
+    // Calculate total length
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.length;
+    }
+    return out.buffer;
+  }
+
+  // CRC32 implementation (polynomial 0xEDB88320) — fast table-based
+  function crc32(buf) {
+    if (!crc32.table) {
+      const table = new Uint32Array(256);
+      for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let j = 0; j < 8; j++) {
+          if (c & 1) c = 0xEDB88320 ^ (c >>> 1);
+          else c = c >>> 1;
+        }
+        table[i] = c >>> 0;
+      }
+      crc32.table = table;
+    }
+    const table = crc32.table;
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < buf.length; i++) {
+      c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+    }
+    return (~c) >>> 0;
+  }
+
+  async function handleFile(e) {
+    setStatus('');
+    const file = e.target.files[0];
+    if (!file) return;
+    setOriginalName(file.name);
+    setStatus('Decoding image in browser...');
+
+    // Read original bytes optionally (for ORIG chunk)
+    let origBytes = null;
+    if (embedOriginal) {
+      origBytes = new Uint8Array(await file.arrayBuffer());
+    }
+
+    // Create ImageBitmap for robust decoding (handles orientation in many browsers)
+    let imgBitmap;
+    try {
+      imgBitmap = await createImageBitmap(file);
+    } catch (err) {
+      setStatus('Failed to decode image: ' + String(err));
+      return;
+    }
+
+    setStatus('Building NPSF file...');
+    const npsfArrayBuffer = await buildNpsf(imgBitmap, origBytes);
+
+    // Offer download
+    const blob = new Blob([npsfArrayBuffer], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const base = (originalName || 'image').replace(/\.[^.]+$/, '');
+    a.download = base + '.npsf';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setStatus('Done — downloaded ' + a.download + '. Note: pixels come from browser decoding (8-bit RGBA).');
+  }
+
+  return (
+    <div className="p-6 max-w-3xl mx-auto font-sans">
+      <h1 className="text-2xl font-bold mb-3">NPSF — No Processing Sample Format</h1>
+      <p className="mb-4">Convert an image in the browser into a lossless, uncompressed NPSF (.npsf) file containing the raw decoded pixel samples (8-bit RGBA). Optionally embed the original file bytes inside the .npsf for safekeeping.</p>
+
+      <label className="block mb-2">Select image to convert</label>
+      <input ref={fileRef} type="file" accept="image/*" onChange={handleFile} className="mb-3" />
+
+      <label className="flex items-center gap-2 mb-3">
+        <input type="checkbox" checked={embedOriginal} onChange={(ev)=>setEmbedOriginal(ev.target.checked)} />
+        <span>Embed original file inside .npsf (ORIG chunk)</span>
+      </label>
+
+      <div className="mb-4">
+        <button onClick={()=>fileRef.current && fileRef.current.click()} className="px-4 py-2 bg-slate-800 text-white rounded">Choose file</button>
+      </div>
+
+      <div className="mb-4 text-sm text-slate-600">{status}</div>
+
+      <canvas ref={canvasRef} style={{display:'none'}} />
+
+      <div className="mt-6 text-xs text-slate-500">Limitations: the browser decodes images to 8-bit RGBA when drawing to canvas. This tool preserves those decoded samples exactly, but cannot access camera RAW native samples (12/14/16-bit or packed raw sensor formats). For camera-native preservation use a native converter (libraw) or server-side tool. The ORIG chunk can store the original uploaded file verbatim if you enable it.</div>
+    </div>
+  );
+}
