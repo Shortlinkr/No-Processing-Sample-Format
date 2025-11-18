@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>NPSF Universal Converter (Image / Audio / Video)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 min-h-screen">
+  <div id="root" class="p-6"></div>
+
+  <!-- React and ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+
+  <!-- Babel for JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useRef, useState, useEffect } = React;
+
+    /**
+     * Full standalone HTML + React implementation of the "V1" universal NPSF encoder:
+     * - Images -> 8-bit RGBA (ImageData from canvas)
+     * - Audio  -> Float32 PCM (interleaved)
+     * - Video  -> sequence of 8-bit RGBA frames captured (requestVideoFrameCallback when available; fallback timed capture)
+     *
+     * Container layout:
+     * - MAGIC: "NPSF\x01"
+     * - u32BE(headerUtf8.length) + header JSON (UTF-8)
+     * - Zero or more chunks: each chunk = 4-byte ASCII type + u32BE(len) + data + u32BE(crc32(type+data))
+     *   - IMAG: single image raw RGBA bytes
+     *   - AUDI: raw Float32 PCM interleaved (little-endian)
+     *   - VIDF: one RGBA frame (8-bit) per chunk
+     *   - ORIG: original file bytes (optional)
+     *   - END!: empty terminator chunk
+     *
+     * Notes:
+     * - "Lossless" means the exact samples decoded by the browser are preserved. For original-file bit-for-bit preservation embed the ORIG chunk.
+     * - Large video files will require a lot of memory/time. A cancel button is available when capturing frames.
+     */
+
+    function NpsfUniversal() {
+      const fileRef = useRef(null);
+      const canvasRef = useRef(null);
+      const videoRef = useRef(null);
+
+      const [status, setStatus] = useState('');
+      const [embedOriginal, setEmbedOriginal] = useState(true);
+      const [processing, setProcessing] = useState(false);
+      const [cancelRequested, setCancelRequested] = useState(false);
+      const MAGIC = new Uint8Array([0x4E,0x50,0x53,0x46,0x01]); // 'NPSF\x01'
+
+      // ---- low-level helpers ----
+      function u32BE(n) {
+        const b = new Uint8Array(4);
+        b[0] = (n >>> 24) & 0xFF;
+        b[1] = (n >>> 16) & 0xFF;
+        b[2] = (n >>> 8) & 0xFF;
+        b[3] = (n >>> 0) & 0xFF;
+        return b;
+      }
+
+      // CRC32 table-based (poly 0xEDB88320)
+      function crc32(buf) {
+        if (!crc32.table) {
+          const table = new Uint32Array(256);
+          for (let i = 0; i < 256; i++) {
+            let c = i;
+            for (let j = 0; j < 8; j++) {
+              c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            }
+            table[i] = c >>> 0;
+          }
+          crc32.table = table;
+        }
+        const table = crc32.table;
+        let c = 0xFFFFFFFF;
+        for (let i = 0; i < buf.length; i++) {
+          c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+        }
+        return (~c) >>> 0;
+      }
+
+      // Ensure type is exactly 4 ASCII bytes
+      function typeToBytes(typeStr) {
+        const t = (typeStr + '    ').slice(0,4); // pad/truncate to 4
+        return new TextEncoder().encode(t);
+      }
+
+      function makeChunk(typeStr, dataUint8) {
+        const typeBytes = typeToBytes(typeStr);
+        const lenBytes = u32BE(dataUint8.length);
+        const chunk = new Uint8Array(4 + 4 + dataUint8.length + 4);
+        chunk.set(typeBytes, 0);
+        chunk.set(lenBytes, 4);
+        chunk.set(dataUint8, 8);
+        const crcInput = new Uint8Array(typeBytes.length + dataUint8.length);
+        crcInput.set(typeBytes, 0);
+        crcInput.set(dataUint8, typeBytes.length);
+        const crc = crc32(crcInput);
+        chunk.set(u32BE(crc), 8 + dataUint8.length);
+        return chunk;
+      }
+
+      function concatParts(parts) {
+        let total = 0;
+        for (const p of parts) total += p.length;
+        const out = new Uint8Array(total);
+        let off = 0;
+        for (const p of parts) {
+          out.set(p, off);
+          off += p.length;
+        }
+        return out;
+      }
+
+      // Interleave channel Float32 arrays into a single Float32Array
+      function interleaveChannels(channelData) {
+        const channels = channelData.length;
+        const len = channelData[0].length;
+        const out = new Float32Array(len * channels);
+        let idx = 0;
+        for (let i = 0; i < len; i++) {
+          for (let c = 0; c < channels; c++) {
+            out[idx++] = channelData[c][i];
+          }
+        }
+        return out;
+      }
+
+      // ---- extractors ----
+
+      // Image extraction -> returns { width, height, pixels: Uint8Array }
+      async function extractImageRGBA(file) {
+        // Use createImageBitmap for robust decoding
+        const bitmap = await createImageBitmap(file);
+        const w = bitmap.width;
+        const h = bitmap.height;
+        const canvas = canvasRef.current;
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,w,h);
+        ctx.drawImage(bitmap, 0, 0, w, h);
+        const im = ctx.getImageData(0,0,w,h);
+        // copy to plain Uint8Array
+        const pixels = new Uint8Array(im.data.buffer.slice(0));
+        return { width: w, height: h, pixels };
+      }
+
+      // Audio extraction -> returns { sampleRate, channels, frames, pcmF32Uint8: Uint8Array }
+      async function extractAudioPCM(file) {
+        const ab = await file.arrayBuffer();
+        // Create AudioContext to decode
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) throw new Error('Web Audio API not supported in this browser');
+        const audioCtx = new AudioCtx();
+        // decodeAudioData sometimes supports promise or callback; wrap both ways
+        const audioBuffer = await new Promise((resolve, reject) => {
+          const p = audioCtx.decodeAudioData(ab.slice(0));
+          if (p && p.then) {
+            p.then(resolve).catch(reject);
+          } else {
+            // older callback API
+            audioCtx.decodeAudioData(ab.slice(0), resolve, reject);
+          }
+        });
+        const channels = audioBuffer.numberOfChannels;
+        const sampleRate = audioBuffer.sampleRate;
+        const frames = audioBuffer.length;
+        const channelData = [];
+        for (let c = 0; c < channels; c++) channelData.push(audioBuffer.getChannelData(c));
+        const interleaved = interleaveChannels(channelData); // Float32Array
+        const pcmF32Bytes = new Uint8Array(interleaved.buffer.slice(0)); // little-endian IEEE-754
+        return { sampleRate, channels, frames, pcmF32Bytes };
+      }
+
+      // Video extraction -> returns { width, height, frames: [Uint8Array], duration, estimatedFps }
+      // Uses requestVideoFrameCallback when available; fallback to timed capture.
+      async function extractVideoFrames(file, onProgress = () => {}) {
+        if (cancelRequested) throw new Error('Cancelled');
+        return new Promise((resolve, reject) => {
+          const url = URL.createObjectURL(file);
+          const video = document.createElement('video');
+          videoRef.current = video;
+          video.src = url;
+          video.muted = true;
+          video.playsInline = true;
+          video.crossOrigin = 'anonymous';
+          video.preload = 'auto';
+
+          const canvas = canvasRef.current;
+          let ctx;
+
+          let stopped = false;
+          function cleanup() {
+            stopped = true;
+            try { video.pause(); } catch {}
+            video.src = '';
+            URL.revokeObjectURL(url);
+          }
+
+          video.addEventListener('loadedmetadata', async () => {
+            if (cancelRequested) {
+              cleanup();
+              reject(new Error('Cancelled'));
+              return;
+            }
+            const w = video.videoWidth;
+            const h = video.videoHeight;
+            const duration = video.duration;
+            canvas.width = w;
+            canvas.height = h;
+            ctx = canvas.getContext('2d');
+
+            const frames = [];
+            let frameCount = 0;
+            let lastTimestamp = null;
+            const timestamps = [];
+
+            function finish() {
+              cleanup();
+              // estimate fps from timestamps if possible
+              let estimatedFps = null;
+              if (timestamps.length >= 2) {
+                // compute average delta in seconds
+                let sum = 0;
+                for (let i = 1; i < timestamps.length; i++) {
+                  sum += (timestamps[i] - timestamps[i-1]);
+                }
+                const avgDeltaMs = (sum / (timestamps.length - 1));
+                estimatedFps = avgDeltaMs > 0 ? Math.round(1000 / avgDeltaMs) : null;
+              }
+              resolve({ width: w, height: h, frames, duration, estimatedFps });
+            }
+
+            // If requestVideoFrameCallback is available, use it
+            if (video.requestVideoFrameCallback) {
+              // Start playback (some browsers require user gesture for unmuted play; muted is usually OK)
+              try { await video.play(); } catch (e) { /* attempting play may fail silently */ }
+              const cb = (now, metadata) => {
+                if (cancelRequested || stopped) { finish(); return; }
+                try {
+                  ctx.drawImage(video, 0, 0, w, h);
+                  const im = ctx.getImageData(0, 0, w, h);
+                  frames.push(new Uint8Array(im.data.buffer.slice(0)));
+                  frameCount++;
+                  // metadata might have presentationTime (ms)
+                  const ts = (metadata && metadata.presentedFrames != null && metadata.presentationTime !== undefined)
+                    ? metadata.presentationTime * 1000 // presentationTime is seconds in some implementations
+                    : performance.now();
+                  timestamps.push(ts);
+                  onProgress(frameCount);
+                } catch (err) {
+                  // ignore drawing errors
+                }
+                if (video.ended || video.paused) {
+                  finish();
+                  return;
+                }
+                // schedule next
+                try {
+                  video.requestVideoFrameCallback(cb);
+                } catch (e) {
+                  // if scheduling fails, finish
+                  finish();
+                }
+              };
+              // schedule first callback
+              try {
+                video.requestVideoFrameCallback(cb);
+              } catch (e) {
+                // fallback to timed capture if scheduling fails
+                fallbackTimed();
+              }
+              video.addEventListener('ended', () => { if (!stopped) finish(); });
+            } else {
+              // fallback: estimate 30 fps and capture while playing
+              async function fallbackTimed() {
+                const estFps = 30;
+                const interval = 1000 / estFps;
+                try { await video.play(); } catch (e) {}
+                function tick() {
+                  if (cancelRequested || video.ended || stopped) {
+                    finish();
+                    return;
+                  }
+                  try {
+                    ctx.drawImage(video, 0, 0, w, h);
+                    const im = ctx.getImageData(0,0,w,h);
+                    frames.push(new Uint8Array(im.data.buffer.slice(0)));
+                    frameCount++;
+                    timestamps.push(performance.now());
+                    onProgress(frameCount);
+                  } catch (err) {}
+                  setTimeout(tick, interval);
+                }
+                tick();
+                video.addEventListener('ended', () => { if (!stopped) finish(); });
+              }
+              fallbackTimed();
+            }
+          });
+
+          video.addEventListener('error', (e) => {
+            cleanup();
+            reject(new Error('Failed to load video for decoding'));
+          });
+        });
+      }
+
+      // ---- builder ----
+      // headerJson: object; chunks: array of { type: 'IMAG'|'AUDI'|'VIDF'|'ORIG', data: Uint8Array }
+      async function buildNpsfUniversal(headerJson, chunks) {
+        const headerUtf8 = new TextEncoder().encode(JSON.stringify(headerJson));
+        const parts = [];
+        parts.push(MAGIC);
+        parts.push(u32BE(headerUtf8.length));
+        parts.push(headerUtf8);
+
+        for (const ch of chunks) {
+          parts.push(makeChunk(ch.type, ch.data));
+        }
+
+        parts.push(makeChunk('END!', new Uint8Array(0)));
+        const out = concatParts(parts);
+        return out.buffer;
+      }
+
+      // ---- top-level handler ----
+      async function handleFileChange(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        setCancelRequested(false);
+        setProcessing(true);
+        setStatus(`Preparing to decode ${file.name}...`);
+
+        let origBytes = null;
+        if (embedOriginal) {
+          setStatus('Reading original bytes (ORIG chunk)...');
+          origBytes = new Uint8Array(await file.arrayBuffer());
+        }
+
+        // detect kind
+        const mime = file.type || '';
+        const ext = (file.name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
+        let kind = 'binary';
+        if (mime.startsWith('image/') || ['.png','.jpg','.jpeg','.webp','.avif','.gif'].includes(ext)) kind = 'image';
+        else if (mime.startsWith('audio/') || ['.mp3','.wav','.flac','.ogg','.m4a'].includes(ext)) kind = 'audio';
+        else if (mime.startsWith('video/') || ['.mp4','.webm','.mov','.mkv','.avi'].includes(ext)) kind = 'video';
+
+        try {
+          if (kind === 'image') {
+            setStatus('Decoding image to RGBA...');
+            const { width, height, pixels } = await extractImageRGBA(file);
+            const header = {
+              media_type: 'image',
+              width,
+              height,
+              channels: 4,
+              channel_order: 'RGBA',
+              bit_depth: 8,
+              color_space: 'sRGB (browser-decoded)',
+              compression: 'none',
+              embed_original: !!origBytes
+            };
+            const chunks = [{ type: 'IMAG', data: pixels }];
+            if (origBytes) chunks.push({ type: 'ORIG', data: origBytes });
+            setStatus('Building NPSF...');
+            const npsf = await buildNpsfUniversal(header, chunks);
+            downloadBuffer(npsf, (file.name.replace(/\.[^.]+$/, '') || 'image') + '.npsf');
+            setStatus('Done — downloaded image .npsf (pixels from browser decoding).');
+          } else if (kind === 'audio') {
+            setStatus('Decoding audio to Float32 PCM (lossless in decoded samples)...');
+            const { sampleRate, channels, frames, pcmF32Bytes } = await extractAudioPCM(file);
+            const header = {
+              media_type: 'audio',
+              subtype: 'pcm_f32',
+              sample_rate: sampleRate,
+              channels,
+              frames,
+              bit_depth: 32,
+              sample_endianness: 'little',
+              compression: 'none',
+              embed_original: !!origBytes
+            };
+            const chunks = [{ type: 'AUDI', data: pcmF32Bytes }];
+            if (origBytes) chunks.push({ type: 'ORIG', data: origBytes });
+            setStatus('Building NPSF...');
+            const npsf = await buildNpsfUniversal(header, chunks);
+            downloadBuffer(npsf, (file.name.replace(/\.[^.]+$/, '') || 'audio') + '.npsf');
+            setStatus('Done — downloaded audio .npsf (Float32 PCM).');
+          } else if (kind === 'video') {
+            setStatus('Decoding video frames (this may take a while). Capturing frames...');
+            // capture frames with progress updates
+            const framesResult = await extractVideoFrames(file, (count) => {
+              setStatus(`Captured ${count} frames...`);
+            });
+            if (cancelRequested) throw new Error('Cancelled by user');
+            const { width, height, frames, duration, estimatedFps } = framesResult;
+            const header = {
+              media_type: 'video',
+              width,
+              height,
+              pixel_format: 'RGBA',
+              bit_depth: 8,
+              frames: frames.length,
+              duration,
+              estimated_fps: estimatedFps || null,
+              compression: 'none',
+              embed_original: !!origBytes
+            };
+            setStatus('Assembling video .npsf (this may also take a while)...');
+            // Build chunks: VIDF per frame (could be memory-heavy)
+            const chunks = [];
+            for (let i = 0; i < frames.length; i++) {
+              if (cancelRequested) throw new Error('Cancelled by user');
+              chunks.push({ type: 'VIDF', data: frames[i] });
+              // yield to UI occasionally
+              if (i % 16 === 0) await new Promise(r => setTimeout(r, 0));
+            }
+            if (origBytes) chunks.push({ type: 'ORIG', data: origBytes });
+            const npsf = await buildNpsfUniversal(header, chunks);
+            downloadBuffer(npsf, (file.name.replace(/\.[^.]+$/, '') || 'video') + '.npsf');
+            setStatus('Done — downloaded video .npsf with RGBA frames.');
+          } else {
+            // generic wrapper
+            setStatus('Unknown file type — wrapping into generic BLOB + optional ORIG chunk...');
+            const blobBytes = new Uint8Array(await file.arrayBuffer());
+            const header = { media_type: 'binary', size: blobBytes.length, embed_original: !!origBytes };
+            const chunks = [{ type: 'BLOB', data: blobBytes }];
+            if (origBytes) chunks.push({ type: 'ORIG', data: origBytes });
+            const npsf = await buildNpsfUniversal(header, chunks);
+            downloadBuffer(npsf, (file.name.replace(/\.[^.]+$/, '') || 'data') + '.npsf');
+            setStatus('Done — downloaded generic .npsf.');
+          }
+        } catch (err) {
+          if (err && err.message === 'Cancelled' || err.message === 'Cancelled by user') {
+            setStatus('Operation cancelled.');
+          } else {
+            console.error(err);
+            setStatus('Error: ' + (err && err.message ? err.message : String(err)));
+          }
+        } finally {
+          setProcessing(false);
+          setCancelRequested(false);
+        }
+      }
+
+      function downloadBuffer(buffer, filename) {
+        const blob = new Blob([buffer], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      function onCancel() {
+        setCancelRequested(true);
+        setStatus('Cancel requested — stopping as soon as possible...');
+      }
+
+      useEffect(() => {
+        // cleanup video element if unmounted
+        return () => {
+          if (videoRef.current) {
+            try { videoRef.current.pause(); videoRef.current.src = ''; } catch {}
+            videoRef.current = null;
+          }
+        };
+      }, []);
+
+      return (
+        <div className="max-w-3xl mx-auto bg-white rounded-xl shadow p-6 font-sans">
+          <h1 className="text-2xl font-bold mb-2">NPSF Universal — Image / Audio / Video (V1)</h1>
+          <p className="text-sm mb-4 text-slate-600">
+            Upload an image, audio, or video file. The browser will decode it to raw samples and pack them into a single
+            <code className="bg-slate-100 px-1 rounded mx-1">.npsf</code> container. Enable <em>Embed original</em> to include the original file bytes verbatim.
+          </p>
+
+          <label className="block mb-2 font-medium">Select media to convert</label>
+          <input ref={fileRef} type="file" accept="image/*,audio/*,video/*,*/*" onChange={handleFileChange} className="mb-3 block" />
+
+          <label className="flex items-center gap-2 mb-3">
+            <input type="checkbox" checked={embedOriginal} onChange={(ev) => setEmbedOriginal(ev.target.checked)} />
+            <span>Embed original file inside .npsf (ORIG chunk)</span>
+          </label>
+
+          <div className="flex gap-2 mb-4">
+            <button onClick={() => fileRef.current && fileRef.current.click()} className={`px-4 py-2 rounded ${processing ? 'opacity-50 cursor-not-allowed' : 'bg-slate-800 text-white'}`} disabled={processing}>Choose file</button>
+            <button onClick={() => { if (!processing && fileRef.current && fileRef.current.files.length) { setProcessing(true); handleFileChange({ target: fileRef.current }); } }} className="px-4 py-2 rounded border">Convert</button>
+            {processing && <button onClick={onCancel} className="px-4 py-2 rounded border text-red-600">Cancel</button>}
+          </div>
+
+          <div className="mb-4 text-sm text-slate-600">{status || (processing ? 'Processing...' : 'Idle')}</div>
+
+          <canvas ref={canvasRef} style={{display:'none'}} />
+
+          <div className="mt-6 text-xs text-slate-500">
+            <strong>Implementation notes:</strong>
+            <ul className="list-disc ml-5 mt-2">
+              <li>Images: decoded to 8-bit RGBA using <code>createImageBitmap</code> + canvas.</li>
+              <li>Audio: decoded by Web Audio (<code>AudioContext.decodeAudioData</code>) and stored as 32-bit float interleaved PCM.</li>
+              <li>Video: frames captured as 8-bit RGBA. Uses <code>requestVideoFrameCallback</code> when available, otherwise falls back to timed capture. This may be slow and memory-heavy for long or high-resolution videos.</li>
+              <li>For true archive-level preservation of a camera RAW or original codec bitstream, keep <em>Embed original</em> checked so the ORIG chunk contains the original file bytes.</li>
+            </ul>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<NpsfUniversal />);
+  </script>
+</body>
+</html>
