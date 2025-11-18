@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NPSF Universal Decoder</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; max-width: 800px; margin: auto; background: #f9fafb; }
+    h1 { text-align: center; margin-bottom: 10px; }
+    canvas, video { display: block; margin: 20px auto; border: 1px solid #ccc; }
+    .status { font-size: 14px; color: #555; text-align: center; margin-top: 10px; }
+    .file-input { display: block; margin: 20px 0; }
+    .download-btn { display: inline-block; margin-top: 20px; padding: 10px 20px; background: #007BFF; color: white; text-decoration: none; border-radius: 5px; }
+    .toggle-container { text-align: center; margin: 10px 0; }
+    label { margin-left: 5px; }
+  </style>
+</head>
+<body>
+  <h1>NPSF Universal Decoder</h1>
+
+  <input id="fileInput" type="file" class="file-input" accept=".npsf">
+  <div class="toggle-container">
+    <input type="checkbox" id="videoToggle" checked>
+    <label for="videoToggle">Full video playback</label>
+  </div>
+  <div class="status" id="status">Idle</div>
+
+  <canvas id="canvas" style="display:none;"></canvas>
+  <video id="video" controls style="display:none;"></video>
+  <div id="original-file-section" style="display:none;">
+    <h2>Original File:</h2>
+    <a id="download-link" href="#" class="download-btn" download="original-file">Download Original File</a>
+  </div>
+
+  <script>
+    function crc32(buf) {
+      if (!crc32.table) {
+        const table = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+          let c = i;
+          for (let j = 0; j < 8; j++) {
+            c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+          }
+          table[i] = c >>> 0;
+        }
+        crc32.table = table;
+      }
+      let c = 0xFFFFFFFF;
+      const table = crc32.table;
+      for (let i = 0; i < buf.length; i++) {
+        c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+      }
+      return (~c) >>> 0;
+    }
+
+    function readUint32BE(buffer, offset) {
+      const dv = new DataView(buffer, offset, 4);
+      return dv.getUint32(0, false);
+    }
+
+    function parseNpsf(buffer) {
+      let offset = 0;
+      const MAGIC = new Uint8Array([0x4E,0x50,0x53,0x46,0x01]); // 'NPSF\x01'
+      for (let i = 0; i < MAGIC.length; i++) {
+        if (buffer[i] !== MAGIC[i]) throw new Error('Invalid NPSF file');
+      }
+      offset += MAGIC.length;
+
+      const chunks = {};
+      const multiChunks = {}; // for VIDF or other repeated chunks
+
+      const dataView = new DataView(buffer);
+
+      while (offset + 12 <= buffer.byteLength) {
+        const type = new TextDecoder().decode(new Uint8Array(buffer.slice(offset, offset+4)));
+        offset += 4;
+        const length = dataView.getUint32(offset, false); // big-endian
+        offset += 4;
+        const chunkData = new Uint8Array(buffer.slice(offset, offset+length));
+        offset += length;
+        const crc = dataView.getUint32(offset, false);
+        offset += 4;
+        const crcInput = new Uint8Array(4 + length);
+        crcInput.set(new TextEncoder().encode(type),0);
+        crcInput.set(chunkData,4);
+        const calcCrc = crc32(crcInput);
+        if (crc !== calcCrc) console.warn(`CRC mismatch on chunk ${type}`);
+
+        if (chunks[type] && type !== 'VIDF') chunks[type] = chunkData; // overwrite non-repeatable
+        else if (type === 'VIDF') {
+          if (!multiChunks['VIDF']) multiChunks['VIDF'] = [];
+          multiChunks['VIDF'].push(chunkData);
+        } else chunks[type] = chunkData;
+      }
+      return { chunks, multiChunks };
+    }
+
+    function displayImage(pixels, width, height) {
+      const canvas = document.getElementById('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      const imageData = new ImageData(new Uint8ClampedArray(pixels), width, height);
+      ctx.putImageData(imageData,0,0);
+      canvas.style.display = 'block';
+    }
+
+    function playVideoFrames(frames, width, height, fps) {
+      const canvas = document.getElementById('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      canvas.style.display = 'block';
+      let i = 0;
+      const interval = 1000/fps;
+      function step() {
+        if(i>=frames.length) return;
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(frames[i]), width, height),0,0);
+        i++;
+        setTimeout(step, interval);
+      }
+      step();
+    }
+
+    function playAudioPCM(floatBytes, sampleRate, channels) {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const f32 = new Float32Array(floatBytes.buffer);
+      const frameCount = f32.length/channels;
+      const buffer = audioCtx.createBuffer(channels, frameCount, sampleRate);
+      for(let c=0;c<channels;c++){
+        const channelData = buffer.getChannelData(c);
+        for(let i=0;i<frameCount;i++){
+          channelData[i] = f32[i*channels + c];
+        }
+      }
+      const src = audioCtx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(audioCtx.destination);
+      src.start();
+    }
+
+    document.getElementById('fileInput').addEventListener('change', async (e)=>{
+      const file = e.target.files[0];
+      if(!file) return;
+      document.getElementById('status').textContent = 'Decoding .npsf file...';
+      document.getElementById('canvas').style.display='none';
+      document.getElementById('video').style.display='none';
+      document.getElementById('original-file-section').style.display='none';
+      const buffer = await file.arrayBuffer();
+      let parsed;
+      try {
+        parsed = parseNpsf(buffer);
+      } catch(err){
+        document.getElementById('status').textContent='Failed to parse NPSF: '+err;
+        return;
+      }
+
+      const { chunks, multiChunks } = parsed;
+      let header = {};
+      if(chunks['HEAD']) {
+        try { header = JSON.parse(new TextDecoder().decode(chunks['HEAD'])); } catch {}
+      }
+
+      try {
+        if(header.media_type==='image' && chunks['IMAG']){
+          const w = header.width || 0;
+          const h = header.height || 0;
+          displayImage(chunks['IMAG'],w,h);
+          document.getElementById('status').textContent='Image decoded successfully';
+        } else if(header.media_type==='audio' && chunks['AUDI']){
+          playAudioPCM(chunks['AUDI'],header.sample_rate || 44100,header.channels||2);
+          document.getElementById('status').textContent='Audio decoded and playing';
+        } else if(header.media_type==='video' && multiChunks['VIDF']){
+          const fps = header.estimated_fps || 30;
+          const width = header.width;
+          const height = header.height;
+          const frames = multiChunks['VIDF'];
+          const fullPlayback = document.getElementById('videoToggle').checked;
+          if(fullPlayback){
+            playVideoFrames(frames,width,height,fps);
+            document.getElementById('status').textContent='Playing video frames';
+          } else {
+            displayImage(frames[0],width,height);
+            document.getElementById('status').textContent='Video first frame displayed (lightweight mode)';
+          }
+        } else {
+          document.getElementById('status').textContent='Unknown or unsupported media type';
+        }
+      } catch(err){
+        document.getElementById('status').textContent='Error displaying media: '+err;
+      }
+
+      // Show ORIG download if exists
+      if(chunks['ORIG']){
+        const blob = new Blob([chunks['ORIG']]);
+        const link = document.getElementById('download-link');
+        link.href = URL.createObjectURL(blob);
+        link.download = file.name.replace(/\.[^.]+$/,'') || 'original-file';
+        document.getElementById('original-file-section').style.display='block';
+      }
+    });
+  </script>
+</body>
+</html>
